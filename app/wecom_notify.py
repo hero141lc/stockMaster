@@ -12,11 +12,29 @@ logger = logging.getLogger(__name__)
 _WECOM_API = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send"
 
 
+def _normalize_wecom_webhook_url(u: str) -> str:
+    """
+    支持三种写法：
+    - 完整 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...
+    - 仅 key（常见误把 key 填进 WECOM_WEBHOOK_URL）
+    - 缺协议的企微域名路径，自动补 https://
+    """
+    u = u.strip()
+    if not u:
+        return u
+    low = u.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return u
+    if "qyapi.weixin.qq.com" in low:
+        return f"https://{u}" if not u.lower().startswith("//") else f"https:{u}"
+    return f"{_WECOM_API}?key={u}"
+
+
 def _webhook_url() -> str | None:
     s = get_settings()
     u = (s.wecom_webhook_url or "").strip()
     if u:
-        return u
+        return _normalize_wecom_webhook_url(u)
     k = (s.wecom_webhook_key or "").strip()
     if k:
         return f"{_WECOM_API}?key={k}"
