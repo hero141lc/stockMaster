@@ -1,0 +1,16 @@
+[Unit]
+Description=Feishu Metaso News Bot (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/feishu-news-bot
+EnvironmentFile=/opt/feishu-news-bot/.env
+ExecStart=/opt/feishu-news-bot/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
