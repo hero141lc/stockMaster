@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from datetime import date
 from typing import Any
 
 import httpx
@@ -10,6 +12,11 @@ from app.config import get_settings
 from app.metaso_client import MetasoClient
 
 logger = logging.getLogger(__name__)
+_YEAR_PATTERN = re.compile(r"(20\d{2})")
+_DATE_PATTERN = re.compile(
+    r"(20\d{2})[年\-/\.](\d{1,2})[月\-/\.](\d{1,2})|"
+    r"(20\d{2})[年\-/\.](\d{1,2})"
+)
 
 
 SYSTEM_PROMPTS: dict[str, str] = {
@@ -88,12 +95,17 @@ async def _exec_metaso_search(
     accumulated: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """执行一次密塔搜索，按 hit id 去重并累积到 accumulated 中（带 __idx 全局编号）。"""
+    s = get_settings()
     client = MetasoClient()
-    data = await client.search(q, size=size)
-    raw_hits = MetasoClient.iter_hits(data)
+    fresh_q = _rewrite_query_for_freshness(q)
+    data = await client.search(fresh_q, size=size)
+    raw_hits = _rank_hits_by_recency(MetasoClient.iter_hits(data))
     seen_ids = {h["id"] for h in accumulated}
     new_hits: list[dict[str, Any]] = []
+    freshness_days = max(1, int(s.analyst_freshness_days))
     for h in raw_hits:
+        if s.analyst_strict_freshness and int(h.get("__age_days", 999999)) > freshness_days:
+            continue
         hid = h.get("id")
         if not hid or hid in seen_ids:
             continue
@@ -126,11 +138,14 @@ def _format_tool_result(
         url = str(h.get("url") or "").strip()
         summ = str(h.get("summary") or "").replace("\n", " ").strip()
         raw = str(h.get("raw") or "").replace("\n", " ").strip()
+        pub_date = str(h.get("__date") or "").strip()
         if len(summ) > 400:
             summ = summ[:400] + "…"
         if len(raw) > 700:
             raw = raw[:700] + "…"
         block = f"[{idx}] {title}\n摘要：{summ}"
+        if pub_date:
+            block += f"\n日期：{pub_date}"
         if raw:
             block += f"\n摘录：{raw}"
         block += f"\n链接：{url}"
@@ -145,7 +160,67 @@ def _format_tool_result(
 def _select_system_prompt() -> str:
     s = get_settings()
     persona = (s.analyst_persona or "cn_sellside").strip().lower()
-    return SYSTEM_PROMPTS.get(persona) or SYSTEM_PROMPTS["cn_sellside"]
+    today = date.today().isoformat()
+    base = SYSTEM_PROMPTS.get(persona) or SYSTEM_PROMPTS["cn_sellside"]
+    freshness_days = max(1, int(s.analyst_freshness_days))
+    strict = "开启" if s.analyst_strict_freshness else "关闭"
+    freshness_guard = (
+        f"\n\n【时效约束】今天是 {today}。优先使用最近 {freshness_days} 天内的资料。"
+        "若引用资料明显早于当前日期，必须明确标注“资料可能过期”。"
+        f"严格时效模式：{strict}。"
+        "若关键结论缺乏近期资料支撑，必须写明“近期公开资料不足，无法给出高置信结论”，"
+        "不得用旧数据冒充最新事实。"
+    )
+    return base + freshness_guard
+
+
+def _rewrite_query_for_freshness(q: str) -> str:
+    raw = q.strip()
+    if not raw:
+        return raw
+    now = date.today()
+    out = raw
+    if not _YEAR_PATTERN.search(out):
+        out = f"{out} {now.year} 最新"
+    if not any(k in out for k in ("最新", "今日", "本周", "近一周", "近一月", "近期")):
+        out = f"{out} 近期"
+    return out
+
+
+def _extract_hit_date(hit: dict[str, Any]) -> date | None:
+    text = " ".join(
+        [
+            str(hit.get("title") or ""),
+            str(hit.get("summary") or ""),
+            str(hit.get("raw") or "")[:1200],
+            str(hit.get("url") or ""),
+        ]
+    )
+    m = _DATE_PATTERN.search(text)
+    if not m:
+        return None
+    if m.group(1):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        y, mo, d = int(m.group(4)), int(m.group(5)), 1
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def _rank_hits_by_recency(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = date.today()
+    ranked: list[dict[str, Any]] = []
+    for h in hits:
+        item = dict(h)
+        dt = _extract_hit_date(item)
+        item["__date"] = dt.isoformat() if dt else ""
+        age_days = (now - dt).days if dt else 999999
+        item["__age_days"] = age_days
+        ranked.append(item)
+    ranked.sort(key=lambda x: int(x.get("__age_days", 999999)))
+    return ranked
 
 
 async def generate_analyst_reply(

@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.2, alias="LLM_TEMPERATURE")
     # 分析师人格：cn_sellside（A 股/港股/美股卖方研究员风格），后续可扩展
     analyst_persona: str = Field(default="cn_sellside", alias="ANALYST_PERSONA")
+    # 时效性控制：优先使用最近 N 天资料，超过则判定为陈旧
+    analyst_freshness_days: int = Field(default=120, alias="ANALYST_FRESHNESS_DAYS")
+    # 严格时效模式：true 时若近 N 天资料不足，必须显式说明不可下结论
+    analyst_strict_freshness: bool = Field(
+        default=True, alias="ANALYST_STRICT_FRESHNESS"
+    )
 
     tz: str = Field(default="Asia/Shanghai", alias="TZ")
     digest_times: str = Field(
