@@ -8,7 +8,7 @@ from typing import Any
 from app.config import get_settings
 from app.feishu_notify import reply_to_message
 from app.metaso_client import MetasoClient
-from app.rag_reply import generate_rag_reply
+from app.rag_reply import generate_analyst_reply
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,8 @@ def extract_message_event(body: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def format_metaso_reply(q: str, hits: list[dict[str, Any]]) -> str:
+    if not hits:
+        return f"未找到与「{q}」相关的结果。"
     lines: list[str] = [f"密塔 · 「{q}」", ""]
     for i, h in enumerate(hits[:10], 1):
         title = h.get("title") or "(无标题)"
@@ -90,20 +92,64 @@ def format_metaso_reply(q: str, hits: list[dict[str, Any]]) -> str:
     return out
 
 
-async def build_interactive_reply(q: str, hits: list[dict[str, Any]]) -> str:
-    """根据 REPLY_MODE 生成对用户问题的回复（RAG 或原始列表）。"""
+async def _metaso_fallback(q: str) -> str:
+    """走老的「单次搜索 + 列表展示」路径，作为 RAG 失败时的兜底。"""
+    try:
+        client = MetasoClient()
+        data = await client.search(q)
+        hits = MetasoClient.iter_hits(data)
+    except Exception as e:
+        logger.exception("metaso fallback search failed")
+        return f"搜索失败：{e}"
+    return format_metaso_reply(q, hits)
+
+
+async def build_interactive_reply(
+    q: str,
+    hits: list[dict[str, Any]] | None = None,
+    *,
+    fast: bool = False,
+) -> str:
+    """生成对用户问题的回复。
+
+    - REPLY_MODE=rag（默认）：调用金融分析师 Agent（自主多轮密塔检索 + 综合）。
+      `hits` 参数被忽略。Agent 失败时回退为「先搜一次 + 列表展示」。
+    - REPLY_MODE=search：旧版行为，仅展示密塔搜索结果列表。
+      若未传入 `hits`，会现场搜一次。
+
+    fast=True：用于响应时间敏感的渠道（如企微被动回复 5 秒上限），
+    将 max_tool_calls 限制为 1，并使用较短超时；失败仍走 metaso 兜底。
+    """
     s = get_settings()
     mode = (s.reply_mode or "rag").strip().lower()
+
     if mode == "search":
-        return format_metaso_reply(q, hits)
+        if not hits:
+            try:
+                client = MetasoClient()
+                data = await client.search(q)
+                hits = MetasoClient.iter_hits(data)
+            except Exception as e:
+                logger.exception("metaso search failed for q=%r", q)
+                return f"搜索失败：{e}"
+        return format_metaso_reply(q, hits or [])
+
+    # rag mode
     if not (s.llm_api_key or "").strip():
-        logger.warning("REPLY_MODE=rag 但未配置 LLM_API_KEY，使用列表模式")
-        return format_metaso_reply(q, hits)
+        logger.warning("REPLY_MODE=rag 但未配置 LLM_API_KEY，回退为列表模式")
+        if hits:
+            return format_metaso_reply(q, hits)
+        return await _metaso_fallback(q)
+
     try:
-        return await generate_rag_reply(q, hits)
+        if fast:
+            return await generate_analyst_reply(q, max_tool_calls=1, timeout=4.0)
+        return await generate_analyst_reply(q)
     except Exception:
-        logger.exception("RAG 生成失败，回退为列表模式")
-        return format_metaso_reply(q, hits)
+        logger.exception("analyst agent failed; fallback to list mode")
+        if hits:
+            return format_metaso_reply(q, hits)
+        return await _metaso_fallback(q)
 
 
 async def handle_incoming_message_event(msg_ev: dict[str, Any]) -> None:
@@ -119,33 +165,33 @@ async def handle_incoming_message_event(msg_ev: dict[str, Any]) -> None:
     if not q:
         await reply_to_message(
             msg_ev["chat_id"],
-            "请直接输入要搜索的内容，或 @机器人 后输入关键词（密塔搜索）。",
+            "请直接输入要搜索的内容，或 @机器人 后输入关键词。",
             root_id=msg_ev.get("root_id") or msg_ev.get("message_id"),
         )
         return
 
-    try:
-        client = MetasoClient()
-        data = await client.search(q)
-        hits = MetasoClient.iter_hits(data)
-    except Exception as e:
-        logger.exception("Metaso search failed")
-        await reply_to_message(
-            msg_ev["chat_id"],
-            f"密塔搜索失败：{e}",
-            root_id=msg_ev.get("root_id") or msg_ev.get("message_id"),
-        )
-        return
+    s = get_settings()
+    mode = (s.reply_mode or "rag").strip().lower()
 
-    if not hits:
-        await reply_to_message(
-            msg_ev["chat_id"],
-            f"未找到与「{q}」相关的结果。",
-            root_id=msg_ev.get("root_id") or msg_ev.get("message_id"),
-        )
-        return
+    if mode == "rag":
+        # rag 模式：由 analyst agent 内部自主搜索，省掉外部预搜索
+        out = await build_interactive_reply(q)
+    else:
+        # search 模式：保留原行为（外部先搜一次 → 列表展示）
+        try:
+            client = MetasoClient()
+            data = await client.search(q)
+            hits = MetasoClient.iter_hits(data)
+        except Exception as e:
+            logger.exception("Metaso search failed")
+            await reply_to_message(
+                msg_ev["chat_id"],
+                f"密塔搜索失败：{e}",
+                root_id=msg_ev.get("root_id") or msg_ev.get("message_id"),
+            )
+            return
+        out = await build_interactive_reply(q, hits)
 
-    out = await build_interactive_reply(q, hits)
     await reply_to_message(
         msg_ev["chat_id"],
         out,

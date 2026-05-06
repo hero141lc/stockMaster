@@ -55,16 +55,18 @@ async def _run_wecom_ws_async() -> None:
             )
             return
 
+        mode = (s.reply_mode or "rag").strip().lower()
         try:
-            data = await MetasoClient().search(q)
-            hits = MetasoClient.iter_hits(data)
-            if not hits:
-                out = f"未找到与「{q}」相关的结果。"
+            if mode == "rag":
+                # 长连接无 5 秒上限，使用完整的分析师 Agent（多轮检索）
+                out = await build_interactive_reply(q)
             else:
+                data = await MetasoClient().search(q)
+                hits = MetasoClient.iter_hits(data)
                 out = await build_interactive_reply(q, hits)
         except Exception as e:
-            logger.exception("wecom ws metaso search failed")
-            out = f"搜索失败：{e}"
+            logger.exception("wecom ws reply failed")
+            out = f"处理失败：{e}"
 
         if len(out) > 3500:
             out = out[:3400] + "\n…（已截断）"

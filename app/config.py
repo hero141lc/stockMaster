@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
     llm_timeout: float = Field(default=90.0, alias="LLM_TIMEOUT")
+    # 分析师 Agent：最多允许的工具调用轮数（每轮可一次或多次 metaso_search）
+    llm_max_tool_calls: int = Field(default=4, alias="LLM_MAX_TOOL_CALLS")
+    # 生成温度（金融分析建议较低，避免发散）
+    llm_temperature: float = Field(default=0.2, alias="LLM_TEMPERATURE")
+    # 分析师人格：cn_sellside（A 股/港股/美股卖方研究员风格），后续可扩展
+    analyst_persona: str = Field(default="cn_sellside", alias="ANALYST_PERSONA")
 
     tz: str = Field(default="Asia/Shanghai", alias="TZ")
     digest_times: str = Field(

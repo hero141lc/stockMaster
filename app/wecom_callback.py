@@ -116,19 +116,23 @@ async def wecom_receive(
     to_user = _xml_text(root, "ToUserName")
 
     if not content:
-        reply = "请发送要搜索的关键词（密塔）。"
+        reply = "请发送要搜索的关键词。"
     else:
+        s = get_settings()
+        mode = (s.reply_mode or "rag").strip().lower()
         try:
-            client = MetasoClient()
-            data = await client.search(content)
-            hits = MetasoClient.iter_hits(data)
-            if not hits:
-                reply = f"未找到与「{content}」相关的结果。"
+            if mode == "rag":
+                # 企微被动回复 5 秒上限：用 fast 模式（最多 1 轮工具调用 + 短超时）
+                # 失败时 build_interactive_reply 内部会回退到列表模式
+                reply = await build_interactive_reply(content, fast=True)
             else:
+                client = MetasoClient()
+                data = await client.search(content)
+                hits = MetasoClient.iter_hits(data)
                 reply = await build_interactive_reply(content, hits)
         except Exception as e:
-            logger.exception("wecom metaso")
-            reply = f"搜索失败：{e}"
+            logger.exception("wecom callback failed")
+            reply = f"处理失败：{e}"
 
     if len(reply) > 2000:
         reply = reply[:1990] + "…"
