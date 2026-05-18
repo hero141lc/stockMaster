@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -32,7 +33,9 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "2. 复杂问题应主动拆解为多个维度（宏观流动性 / 政策 / 行业景气 / 公司基本面 / "
         "资金 / 海外联动），分多次调用 metaso_search，每次用一个聚焦的子查询。\n"
         "3. 简单的概念解释或常识性问题可不调用工具直接作答。\n"
-        "4. 严禁编造检索资料中不存在的事实、数字或公司名称。如关键数据缺失，明确写出"
+        "4. 凡涉及「今天」「今年」「近期」「本周」或需在 metaso_search 查询词中标注"
+        "年月日时，应先调用 get_current_time 获取准确时间，勿凭模型内置记忆臆测年份。"
+        "5. 严禁编造检索资料中不存在的事实、数字或公司名称。如关键数据缺失，明确写出"
         "「暂未获取到 XX 数据」。\n"
         "\n"
         "【输出结构】用简体中文，按以下骨架组织最终答复（章节标题用 Markdown 加粗）：\n"
@@ -54,7 +57,47 @@ SYSTEM_PROMPTS: dict[str, str] = {
 }
 
 
-METASO_TOOL_SCHEMA: list[dict[str, Any]] = [
+_WEEKDAY_ZH = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+
+def _resolve_tz() -> ZoneInfo:
+    s = get_settings()
+    name = (s.tz or "Asia/Shanghai").strip() or "Asia/Shanghai"
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        logger.warning("invalid TZ=%r, fallback to Asia/Shanghai", name)
+        return ZoneInfo("Asia/Shanghai")
+
+
+def _current_time_context() -> str:
+    """返回供系统提示与 get_current_time 工具共用的当前时间描述。"""
+    tz = _resolve_tz()
+    now = datetime.now(tz)
+    weekday = _WEEKDAY_ZH[now.weekday()]
+    quarter = (now.month - 1) // 3 + 1
+    return (
+        f"{now.year}年{now.month}月{now.day}日 {weekday} "
+        f"{now.strftime('%H:%M:%S')}（时区 {tz.key}）\n"
+        f"ISO：{now.isoformat(timespec='seconds')}\n"
+        f"年份：{now.year}；季度：Q{quarter}"
+    )
+
+
+ANALYST_TOOL_SCHEMA: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": (
+                "获取服务器当前的准确日期与时间（含年份、星期、时区）。"
+                "大模型训练数据可能滞后，切勿默认当前为 2024 年或更早。"
+                "涉及「今天」「今年」「近期」「本周」或需在搜索词中标注年月日时，"
+                "应先调用本工具再作答或调用 metaso_search。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -160,12 +203,13 @@ def _format_tool_result(
 def _select_system_prompt() -> str:
     s = get_settings()
     persona = (s.analyst_persona or "cn_sellside").strip().lower()
-    today = date.today().isoformat()
     base = SYSTEM_PROMPTS.get(persona) or SYSTEM_PROMPTS["cn_sellside"]
     freshness_days = max(1, int(s.analyst_freshness_days))
     strict = "开启" if s.analyst_strict_freshness else "关闭"
     freshness_guard = (
-        f"\n\n【时效约束】今天是 {today}。优先使用最近 {freshness_days} 天内的资料。"
+        f"\n\n【当前时间】\n{_current_time_context()}\n"
+        f"（也可调用 get_current_time 工具再次确认。）\n"
+        f"\n【时效约束】优先使用最近 {freshness_days} 天内的资料。"
         "若引用资料明显早于当前日期，必须明确标注“资料可能过期”。"
         f"严格时效模式：{strict}。"
         "若关键结论缺乏近期资料支撑，必须写明“近期公开资料不足，无法给出高置信结论”，"
@@ -268,7 +312,7 @@ async def generate_analyst_reply(
             "messages": messages,
         }
         if with_tools:
-            payload["tools"] = METASO_TOOL_SCHEMA
+            payload["tools"] = ANALYST_TOOL_SCHEMA
             payload["tool_choice"] = "auto"
         r = await client.post(url, headers=headers, json=payload)
         try:
@@ -321,13 +365,25 @@ async def generate_analyst_reply(
                 except json.JSONDecodeError:
                     fargs = {}
 
+                if fname == "get_current_time":
+                    tool_text = _current_time_context()
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": tool_text,
+                        }
+                    )
+                    continue
+
                 if fname != "metaso_search":
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc_id,
                             "content": (
-                                f"工具 {fname!r} 不存在；当前仅支持 metaso_search。"
+                                f"工具 {fname!r} 不存在；"
+                                "当前支持 get_current_time、metaso_search。"
                             ),
                         }
                     )
